@@ -18,14 +18,6 @@ class CardTest < ActiveSupport::TestCase
     assert_equal account.reload.cards_count, card.number
   end
 
-  test "capturing messages" do
-    assert_difference -> { cards(:logo).comments.count }, +1 do
-      cards(:logo).comments.create!(body: "Agreed.")
-    end
-
-    assert_equal "Agreed.", cards(:logo).comments.last.body.to_plain_text.chomp
-  end
-
   test "assignment states" do
     assert cards(:logo).assigned_to?(users(:kevin))
     assert_not cards(:logo).assigned_to?(users(:david))
@@ -122,39 +114,81 @@ class CardTest < ActiveSupport::TestCase
     end
   end
 
-  test "grants access to assignees when moved to a new board" do
+  test "an admin mover grants access to assignees when moving the card to a new board" do
+    board = accounts("37s").boards.create!(name: "David's board", creator: users(:david), all_access: false)
+    board.accesses.grant_to(users(:kevin)) # kevin can reach the board, but did not create it
+    Current.session = sessions(:kevin) # admin, and a member of both the source and destination boards
     card = cards(:logo)
-    assignee = users(:david)
-    card.toggle_assignment(assignee)
+    assignee = users(:jz) # already assigned to the card via fixtures, no access to the destination board
 
-    board = boards(:private)
-    assert_not_includes board.users, assignee
+    assert Current.user.admin?
+    assert_not_equal Current.user, board.creator # authorized through the admin role, not the creator path
+    assert board.accessible_to?(users(:kevin))
+    assert_includes card.assignees, assignee
+    assert_not board.accessible_to?(assignee)
 
     card.update!(board: board)
     assert_includes board.users.reload, assignee
   end
 
+  test "a non-admin board creator grants access to assignees when moving the card to a new board" do
+    Current.session = sessions(:david) # plain member, but the creator of the destination board
+    board = accounts("37s").boards.create!(name: "David's board", creator: users(:david), all_access: false)
+    card = cards(:logo)
+    assignee = users(:jz) # already assigned to the card via fixtures, no access to the new board
+
+    assert_not Current.user.admin?
+    assert Current.user.can_administer_board?(board) # authorized through the creator path, not the admin role
+    assert_includes card.assignees, assignee
+    assert_not board.accessible_to?(assignee)
+
+    card.update!(board: board)
+    assert_includes board.users.reload, assignee
+  end
+
+  test "a member with mere board access does not grant assignees access when moving the card" do
+    Current.session = sessions(:david) # plain member: not an admin and not the private board's creator
+    board = boards(:private)
+    board.accesses.grant_to(users(:david)) # david holds mere access to the private board, not administration rights
+    card = cards(:logo)
+    assignee = users(:jz) # already assigned to the card via fixtures, no access to the private board
+
+    assert board.accessible_to?(users(:david))
+    assert_not Current.user.can_administer_board?(board)
+    assert_includes card.assignees, assignee
+    assert_not board.accessible_to?(assignee)
+
+    card.update!(board: board)
+
+    assert_not_includes board.users.reload, assignee,
+      "a member with mere board access must not grant others access to a private board via a card move"
+  end
+
   test "move cards to a different board" do
     card = cards(:logo)
-    old_board = boards(:writebook)
+    old_board = card.board
     new_board = boards(:private)
 
-    assert_equal old_board, card.board
+    card.comments.create!(body: "Sensitive information", creator: users(:david))
 
-    assert card.events.where(board: old_board).exists?
+    card_events_on_old_board = card.events.where(board: old_board)
+    comment_events_on_old_board = Event.where(board: old_board, eventable: card.comments)
+
+    assert card_events_on_old_board.exists?
+    assert comment_events_on_old_board.exists?
 
     card.move_to(new_board)
 
     assert_equal new_board, card.reload.board
 
-    events_in_old_board = card.events.where(board: old_board)
-    events_in_new_board = card.events.where(board: new_board)
+    card_events_on_new_board = card.events.where(board: new_board)
+    comment_events_on_new_board = Event.where(board: new_board, eventable: card.comments)
 
-    assert_empty events_in_old_board
-    assert events_in_new_board.exists?
-
-    board_changed_event = events_in_new_board.find { |event| event.action == "card_board_changed" }
-    assert board_changed_event
+    assert_empty card_events_on_old_board
+    assert_empty comment_events_on_old_board
+    assert card_events_on_new_board.exists?
+    assert comment_events_on_new_board.exists?
+    assert card_events_on_new_board.find_by(action: "card_board_changed")
   end
 
   test "a card is filled if it has either the title or the description set" do
@@ -162,5 +196,79 @@ class CardTest < ActiveSupport::TestCase
     assert Card.new(description: "Some description").filled?
 
     assert_not Card.new.filled?
+  end
+
+  test "pins are deleted when card moves to a board user cannot access" do
+    card = cards(:logo)
+    kevin = users(:kevin)
+    david = users(:david)
+
+    # David pins the card (Kevin already has it pinned via fixture)
+    card.pin_by(david)
+
+    assert card.pinned_by?(kevin)
+    assert card.pinned_by?(david)
+
+    # Kevin has access to the private board, David does not
+    assert boards(:private).accessible_to?(kevin)
+    assert_not boards(:private).accessible_to?(david)
+
+    perform_enqueued_jobs only: Card::CleanInaccessibleDataJob do
+      card.move_to(boards(:private))
+    end
+
+    assert card.pinned_by?(kevin), "Kevin's pin should remain (has board access)"
+    assert_not card.pinned_by?(david), "David's pin should be deleted (no board access)"
+  end
+
+  test "watches are deleted when card moves to a board user cannot access" do
+    card = cards(:logo)
+    kevin = users(:kevin)
+    david = users(:david)
+
+    # Both watch the card via fixtures
+    assert card.watched_by?(kevin)
+    assert card.watched_by?(david)
+
+    # Kevin has access to the private board, David does not
+    assert boards(:private).accessible_to?(kevin)
+    assert_not boards(:private).accessible_to?(david)
+
+    perform_enqueued_jobs only: Card::CleanInaccessibleDataJob do
+      card.move_to(boards(:private))
+    end
+
+    assert card.watched_by?(kevin), "Kevin's watch should remain (has board access)"
+    assert_not card.watched_by?(david), "David's watch should be deleted (no board access)"
+  end
+
+  test "clean_inaccessible_data removes assignments for users without board access" do
+    card = boards(:private).cards.create!(title: "Secret", creator: users(:kevin))
+    david = users(:david)
+    card.assignments.create!(assignee: david, assigner: users(:kevin))
+
+    assert_not boards(:private).accessible_to?(david)
+    assert card.assigned_to?(david)
+
+    travel 1.minute
+    assert_changes -> { card.reload.updated_at }, "cleanup must touch the card so board views refresh" do
+      card.clean_inaccessible_data
+    end
+
+    assert_not card.reload.assigned_to?(david)
+  end
+
+  test "card has reactions association" do
+    card = cards(:logo)
+    user = users(:david)
+
+    assert_difference "card.reactions.count", +1 do
+      card.reactions.create!(content: "👍", reacter: user)
+    end
+
+    reaction = card.reactions.last
+    assert_equal "👍", reaction.content
+    assert_equal user, reaction.reacter
+    assert_equal card, reaction.reactable
   end
 end

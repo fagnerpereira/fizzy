@@ -14,7 +14,7 @@ class User < ApplicationRecord
   has_many :closures, dependent: :nullify
   has_many :pins, dependent: :destroy
   has_many :pinned_cards, through: :pins, source: :card
-  has_many :exports, class_name: "Account::Export", dependent: :destroy
+  has_many :data_exports, class_name: "User::DataExport", dependent: :destroy
 
   def deactivate
     transaction do
@@ -36,8 +36,7 @@ class User < ApplicationRecord
     update!(verified_at: Time.current) unless verified?
   end
 
-  private
-    def close_remote_connections
-      ActionCable.server.remote_connections.where(current_user: self).disconnect(reconnect: false)
-    end
+  def close_remote_connections(reconnect: false)
+    ActionCable.server.remote_connections.where(current_user: self).disconnect(reconnect:)
+  end
 end

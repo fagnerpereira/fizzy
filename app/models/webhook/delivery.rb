@@ -22,8 +22,8 @@ class Webhook::Delivery < ApplicationRecord
 
   after_create_commit :deliver_later
 
-  def self.cleanup
-    stale.delete_all
+  def self.cleanup(batch_size: 500, pause: 0.1)
+    sleep pause until stale.limit(batch_size).delete_all.zero?
   end
 
   def deliver_later
@@ -42,6 +42,18 @@ class Webhook::Delivery < ApplicationRecord
   rescue
     errored!
     raise
+  end
+
+  def sanitized_request
+    if headers = request&.dig("headers")&.except("X-Webhook-Signature")
+      { headers: headers }
+    end
+  end
+
+  def response_summary
+    if response.present?
+      { code: response[:code], error: response[:error] }
+    end
   end
 
   def failed?
@@ -67,7 +79,7 @@ class Webhook::Delivery < ApplicationRecord
       end
     rescue ResponseTooLarge
       { error: :response_too_large }
-    rescue Resolv::ResolvTimeout, Resolv::ResolvError, SocketError
+    rescue Surfguard::Unresolvable, Resolv::ResolvTimeout, Resolv::ResolvError, SocketError
       { error: :dns_lookup_failed }
     rescue Net::OpenTimeout, Net::ReadTimeout, Errno::ETIMEDOUT
       { error: :connection_timeout }
@@ -87,7 +99,7 @@ class Webhook::Delivery < ApplicationRecord
 
     def resolved_ip
       return @resolved_ip if defined?(@resolved_ip)
-      @resolved_ip = SsrfProtection.resolve_public_ip(uri.host)
+      @resolved_ip = Surfguard.resolve_public_ips(uri.host).first
     end
 
     def uri
